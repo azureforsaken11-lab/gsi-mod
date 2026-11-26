@@ -1,0 +1,7 @@
+# Paths to delete, relative to the system root. One per line.
+# Check the names against your GSI first (unpack it or browse with a file manager).
+# Examples (uncomment what exists on your build):
+#app/Email
+#app/Music
+#app/Jelly
+#priv-app/Eleven
