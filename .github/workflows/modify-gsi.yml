@@ -8,7 +8,7 @@ on:
         required: true
       extra_mb:
         description: "Extra free space to add to the image while modding (MB)"
-        default: "400"
+        default: "1500"
       donor_gsi_url:
         description: "Optional: direct URL of an Android 8.x arm64 GSI to take the Oreo easter egg from"
         required: false
@@ -61,11 +61,14 @@ jobs:
           EXTRA_MB: ${{ inputs.extra_mb }}
         run: |
           set -euxo pipefail
-          # Un-dedup shared blocks so the image can be mounted read-write
-          e2fsck -fy -E unshare_blocks raw.img || [ $? -le 2 ]
+          # Grow the image FIRST: unsharing blocks needs free space
           truncate -s +"${EXTRA_MB}M" raw.img
           e2fsck -fy raw.img || [ $? -le 2 ]
           resize2fs raw.img
+          # Now un-dedup shared blocks so the image can be mounted read-write
+          e2fsck -fy -E unshare_blocks raw.img || [ $? -le 2 ]
+          # Verify it is clean (must exit 0 or 1)
+          e2fsck -fy raw.img || [ $? -le 1 ]
 
       - name: Download donor Android 8 GSI (for the Oreo easter egg)
         if: ${{ inputs.donor_gsi_url != '' }}
