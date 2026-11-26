@@ -1,0 +1,7 @@
+# build.prop edits, KEY=VALUE. Existing keys are replaced, new ones appended.
+# Nothing is active by default. Uncomment what you want.
+
+# Cosmetic only: makes Settings > About show Android 8.1.0.
+# Apps check SDK level (31), not this string, but a few may behave oddly.
+#ro.build.version.release=8.1.0
+#ro.build.version.release_or_codename=8.1.0
