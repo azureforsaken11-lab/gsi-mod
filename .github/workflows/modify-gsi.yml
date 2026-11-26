@@ -1,0 +1,166 @@
+name: Modify GSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct download URL of an arm64-ab GSI (.img, .img.xz, .gz or .zip)"
+        required: true
+      extra_mb:
+        description: "Extra free space to add to the image while modding (MB)"
+        default: "400"
+      donor_gsi_url:
+        description: "Optional: direct URL of an Android 8.x arm64 GSI to take the Oreo easter egg from"
+        required: false
+        default: ""
+
+jobs:
+  modify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs xz-utils unzip attr file rsync
+
+      - name: Download and unpack GSI
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o gsi.bin "$GSI_URL"
+          case "$(file -b gsi.bin)" in
+            XZ*)   mv gsi.bin gsi.xz; xz -d gsi.xz; mv gsi gsi.img ;;
+            gzip*) mv gsi.bin gsi.gz; gunzip gsi.gz; mv gsi gsi.img ;;
+            Zip*)  mkdir z; unzip -o gsi.bin -d z; mv "$(find z -name '*.img' | head -n1)" gsi.img ;;
+            *)     mv gsi.bin gsi.img ;;
+          esac
+          # Sparse -> raw
+          if file -b gsi.img | grep -qi "sparse"; then
+            simg2img gsi.img raw.img && rm gsi.img
+          else
+            mv gsi.img raw.img
+          fi
+          FS="$(blkid -o value -s TYPE raw.img || true)"
+          echo "Filesystem: $FS"
+          if [ "$FS" != "ext4" ]; then
+            echo "::error::This GSI uses '$FS'. This workflow only supports ext4 images. Pick an ext4 build."
+            exit 1
+          fi
+
+      - name: Make image writable and grow it
+        env:
+          EXTRA_MB: ${{ inputs.extra_mb }}
+        run: |
+          set -euxo pipefail
+          # Un-dedup shared blocks so the image can be mounted read-write
+          e2fsck -fy -E unshare_blocks raw.img || [ $? -le 2 ]
+          truncate -s +"${EXTRA_MB}M" raw.img
+          e2fsck -fy raw.img || [ $? -le 2 ]
+          resize2fs raw.img
+
+      - name: Download donor Android 8 GSI (for the Oreo easter egg)
+        if: ${{ inputs.donor_gsi_url != '' }}
+        env:
+          DONOR_URL: ${{ inputs.donor_gsi_url }}
+        run: |
+          set -euxo pipefail
+          mkdir donor && cd donor
+          curl -fL --retry 3 -o d.bin "$DONOR_URL"
+          case "$(file -b d.bin)" in
+            XZ*)   mv d.bin d.xz; xz -d d.xz; mv d d.img ;;
+            gzip*) mv d.bin d.gz; gunzip d.gz; mv d d.img ;;
+            Zip*)  mkdir z; unzip -o d.bin -d z; mv "$(find z -name '*.img' | head -n1)" d.img ;;
+            *)     mv d.bin d.img ;;
+          esac
+          if file -b d.img | grep -qi "sparse"; then
+            simg2img d.img ../donor_raw.img
+          else
+            mv d.img ../donor_raw.img
+          fi
+          cd .. && rm -rf donor
+          sudo mkdir -p /mnt/donor
+          sudo mount -o loop,ro donor_raw.img /mnt/donor
+
+      - name: Mount and apply mods
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /mnt/gsi
+          sudo mount -o loop,rw raw.img /mnt/gsi
+
+          # Some GSIs are system-as-root (files under /system), some are not
+          if [ -f /mnt/gsi/system/build.prop ]; then ROOT=/mnt/gsi/system; else ROOT=/mnt/gsi; fi
+          echo "System root: $ROOT"
+
+          # 1) Debloat: remove paths listed in debloat.txt (relative to system root)
+          if [ -f debloat.txt ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ""|\#*) continue ;; esac
+              sudo rm -rf "$ROOT/$line"
+            done < debloat.txt
+          fi
+
+          # 2) build.prop edits: KEY=VALUE lines in props.txt
+          if [ -f props.txt ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ""|\#*) continue ;; esac
+              key="${line%%=*}"
+              sudo sed -i "/^${key}=/d" "$ROOT/build.prop"
+              echo "$line" | sudo tee -a "$ROOT/build.prop" > /dev/null
+            done < props.txt
+          fi
+
+          # 3) Overlay: everything in overlay/ is copied onto the system root
+          #    (APKs -> app/Name/Name.apk, boot animation -> media/bootanimation.zip, fonts, etc.)
+          if [ -d overlay ]; then
+            sudo rsync -a --chmod=D755,F644 overlay/ "$ROOT/"
+            (cd overlay && find . -mindepth 1) | while IFS= read -r p; do
+              sudo setfattr -n security.selinux -v u:object_r:system_file:s0 "$ROOT/$p"
+            done
+          fi
+
+          # 4) Oreo easter egg from the donor GSI
+          if mountpoint -q /mnt/donor; then
+            EGG="$(find /mnt/donor -name 'EasterEgg*.apk' 2>/dev/null | head -n1)"
+            if [ -n "$EGG" ]; then
+              # remove the Android 12 egg (same package, com.android.egg)
+              find "$ROOT" -type d -name 'EasterEgg*' -prune -exec sudo rm -rf {} +
+              sudo mkdir -p "$ROOT/app/EasterEgg"
+              sudo cp "$EGG" "$ROOT/app/EasterEgg/EasterEgg.apk"
+              sudo chmod 755 "$ROOT/app/EasterEgg"
+              sudo chmod 644 "$ROOT/app/EasterEgg/EasterEgg.apk"
+              sudo setfattr -n security.selinux -v u:object_r:system_file:s0 "$ROOT/app/EasterEgg"
+              sudo setfattr -n security.selinux -v u:object_r:system_file:s0 "$ROOT/app/EasterEgg/EasterEgg.apk"
+              echo "Installed Oreo easter egg from $EGG"
+            else
+              echo "::warning::No EasterEgg*.apk found in the donor image, skipping."
+            fi
+            sudo umount /mnt/donor
+          fi
+
+          sync
+          sudo umount /mnt/gsi
+
+      - name: Shrink and package
+        run: |
+          set -euxo pipefail
+          e2fsck -fy raw.img || [ $? -le 2 ]
+          resize2fs -M raw.img
+          img2simg raw.img system-mod.img
+          xz -T0 -6 system-mod.img
+          ls -lh system-mod.img.xz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: system-mod
+          path: system-mod.img.xz
+          compression-level: 0
+          retention-days: 14
